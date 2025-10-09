@@ -29,6 +29,8 @@ class UserInput(BaseModel):
     reason: Optional[str] = None
     user_id: Optional[str] = None
     input_text: Optional[str] = None  # For follow-up inputs like 'mindfulness'
+    conversation_id: Optional[str] = None
+    stop: Optional[bool] = False
 
 class SerenitySupport:
     def __init__(self):
@@ -56,6 +58,7 @@ class SerenitySupport:
             )
             self.user_profiles: Dict[str, Dict] = {}
             self.conversation_history: Dict[str, List[Dict]] = {}
+            self.conversation_state: Dict[str, Dict] = {}
             self.mood_library: Dict[str, Dict[str, List[str]]] = {
                 "sad": {
                     "intros": [
@@ -203,15 +206,13 @@ class SerenitySupport:
             logger.error(f"Analysis error: {e}")
             return {"moods": ["uncertain"], "tone": "neutral", "context": []}
 
-    def generate_response(self, user_input: str, user_id: str, age: Optional[int] = None, reason: Optional[str] = None) -> str:
+    def generate_response(self, user_input: str, user_id: str, age: Optional[int] = None, reason: Optional[str] = None, conversation_id: Optional[str] = None, stop: bool = False) -> Dict[str, any]:
         """Generate a comprehensive, empathetic response with detailed mental health guidance."""
         try:
-            analysis = self.analyze_mood_and_tone(user_input, user_id)
-            moods, tone, context = analysis["moods"], analysis["tone"], analysis["context"]
-            profile = self.user_profiles[user_id]
-            used_responses = profile.get("used_responses", [])
-            if age is not None:
-                profile["age"] = age
+            if conversation_id and stop:
+                if conversation_id in self.conversation_state:
+                    del self.conversation_state[conversation_id]
+                return {"response": "Thank you for talking with me. I'm here if you need anything else.", "conversation_id": None}
 
             special_inputs = {
                 "mindfulness": {
@@ -276,88 +277,135 @@ class SerenitySupport:
                 }
             }
 
-            if user_input.lower() in special_inputs:
-                response_parts = special_inputs[user_input.lower()]["response"]
-                follow_up = special_inputs[user_input.lower()]["follow_up"]
+            if conversation_id and conversation_id in self.conversation_state:
+                # Continue conversation
+                state = self.conversation_state[conversation_id]
+                mood = state["mood"]
+                used_responses = state.get("used_responses", [])
+
+                if user_input.lower() in special_inputs:
+                    response_parts = special_inputs[user_input.lower()]["response"]
+                    follow_up = special_inputs[user_input.lower()]["follow_up"]
+                    final_response = "\n".join(response_parts) + "\n" + follow_up
+                    return {"response": final_response, "conversation_id": conversation_id}
+
+                # Generate a new follow-up question
+                components = self.mood_library.get(mood, {})
+                if not components:
+                    if conversation_id in self.conversation_state:
+                        del self.conversation_state[conversation_id]
+                    return {"response": "I'm not sure how to continue on this topic, but I'm here to listen if you want to talk about something else.", "conversation_id": None}
+
+                available_follow_ups = [f for f in components.get("follow_ups", []) if f not in used_responses]
+                if not available_follow_ups:
+                    if conversation_id in self.conversation_state:
+                        del self.conversation_state[conversation_id]
+                    return {"response": "I think we've covered a lot on this topic. Is there something else you'd like to talk about?", "conversation_id": None}
+
+                follow_up = random.choice(available_follow_ups)
+                used_responses.append(follow_up)
+                self.conversation_state[conversation_id]["used_responses"] = used_responses
+                return {"response": follow_up, "conversation_id": conversation_id}
             else:
+                # New conversation
+                conversation_id = f"conv_{uuid4()}"
+                analysis = self.analyze_mood_and_tone(user_input, user_id)
+                moods, tone, context = analysis["moods"], analysis["tone"], analysis["context"]
                 mood = moods[0] if moods else "uncertain"
+                profile = self.user_profiles.get(user_id, {})
+                used_responses = profile.get("used_responses", [])
+                if age is not None:
+                    profile["age"] = age
+
                 response_parts = []
+                follow_up = ""
 
-                if mood in self.mood_library:
-                    components = self.mood_library[mood]
-                    intro = random.choice([i for i in components["intros"] if i not in used_responses] or components["intros"])
-                    intro = intro.format(reason=reason or "this moment")
-                    response_parts.append(intro)
-
-                    if "social" in context and reason and "relationship" in reason.lower():
-                        steps = components.get("relationship_steps", components["steps"])
-                    else:
-                        steps = components["steps"]
-
-                    available_steps = [s for s in steps if s not in used_responses]
-                    selected_steps = random.sample(available_steps, min(5, len(available_steps))) if available_steps else random.sample(steps, min(5, len(steps)))
-                    response_parts.append("\nHere’s a guide to keep your heart glowing:\n" if mood == "happy" else "\nHere’s a gentle guide to help you navigate this moment:\n")
-                    for i, step in enumerate(selected_steps, 1):
-                        step = step.format(reason=reason or "this moment")
-                        response_parts.append(f"Step {i}: {step}")
-                        used_responses.append(step)
-
-                    available_follow_ups = [f for f in components["follow_ups"] if f not in used_responses]
-                    follow_up = random.choice(available_follow_ups or components["follow_ups"])
-                    used_responses.append(follow_up)
+                if user_input.lower() in special_inputs:
+                    response_parts = special_inputs[user_input.lower()]["response"]
+                    follow_up = special_inputs[user_input.lower()]["follow_up"]
                 else:
-                    age_context = "a young adult" if age and 18 <= age <= 25 else "someone navigating their emotions"
-                    tone_instruction = "uplifting and celebratory" if mood == "happy" else "compassionate and validating"
-                    prompt = (
-                        f"You are SerenityBot, responding in a {tone_instruction} tone. The user, {age_context}, is feeling '{mood}' because of '{reason or 'unknown'}'. "
-                        f"Input: '{user_input}'. Context: {', '.join(context) or 'none'}. "
-                        f"Generate a response starting with a heartfelt intro (e.g., 'I’m so thrilled...' for happy, 'I'm really sorry...' for others). "
-                        f"Follow with 5 numbered steps (use emojis like 🌞, 🎉 for happy; 🌿, 🧠 for others) offering immediate and long-term mental health strategies (e.g., gratitude, sharing joy for happy; grounding, self-care for others) tailored to the mood and reason. "
-                        f"End with 3 diverse follow-up options. Use an empowering tone."
-                    )
-                    try:
-                        gemini_response = self.model.generate_content(prompt)
-                        response_parts.append(gemini_response.text)
-                        follow_up = f"Would you like to {'plan a joyful activity' if mood == 'happy' else 'try a mindfulness exercise'}, create a {'joy plan' if mood == 'happy' else 'self-care plan'}, or {'connect with others' if mood == 'happy' else 'find support resources'}? (Type {'plan' if mood == 'happy' else 'mindfulness'}, {'plan' if mood == 'happy' else 'plan'}, {'connect' if mood == 'happy' else 'resources'}, or share more.)"
-                    except Exception as e:
-                        logger.warning(f"Gemini response failed: {e}")
-                        if mood == "happy":
-                            response_parts.append(
-                                "I’m so thrilled you’re feeling happy—it’s such a beautiful moment!\n"
-                                "Here’s a guide to keep your heart glowing:\n"
-                                "Step 1: 🌞 Pause and feel this joy in your body.\n"
-                                "Step 2: 🧠 Name what’s making you happy.\n"
-                                "Step 3: 🎉 Share it with a friend or loved one.\n"
-                                "Step 4: 💡 Do something fun, like dancing.\n"
-                                "Step 5: 🫂 Write 3 things you’re grateful for."
-                            )
-                            follow_up = "Want to plan a fun activity or share more? (Type 'plan', 'share', or your thoughts.)"
-                        else:
-                            response_parts.append(
-                                "I'm really sorry you're feeling this way—it’s tough, and you’re not alone.\n"
-                                "Here’s a gentle guide to help you today:\n"
-                                "Step 1: 🌿 Take 5 deep breaths to calm your body.\n"
-                                "Step 2: 🧠 Name one feeling, like ‘I’m sad.’\n"
-                                "Step 3: ✍️ Write one thought to release it.\n"
-                                "Step 4: 💡 Ground yourself: Name 5 things you see.\n"
-                                "Step 5: 🫂 Do one kind thing, like resting."
-                            )
-                            follow_up = "Want to try a calming exercise or talk more? (Type 'exercise', 'talk', or your thoughts.)"
+                    if mood in self.mood_library:
+                        components = self.mood_library[mood]
+                        intro = random.choice([i for i in components["intros"] if i not in used_responses] or components["intros"])
+                        intro = intro.format(reason=reason or "this moment")
+                        response_parts.append(intro)
 
-            profile["used_responses"] = used_responses[-50:]
-            final_response = "\n".join(response_parts) + "\n" + follow_up
-            self.conversation_history[user_id][-1]["response"] = final_response
-            logger.info(f"User: {user_input}\nResponse: {final_response}")
-            return final_response
+                        if "social" in context and reason and "relationship" in reason.lower():
+                            steps = components.get("relationship_steps", components["steps"])
+                        else:
+                            steps = components["steps"]
+
+                        available_steps = [s for s in steps if s not in used_responses]
+                        selected_steps = random.sample(available_steps, min(5, len(available_steps))) if available_steps else random.sample(steps, min(5, len(steps)))
+                        response_parts.append("\nHere’s a guide to keep your heart glowing:\n" if mood == "happy" else "\nHere’s a gentle guide to help you navigate this moment:\n")
+                        for i, step in enumerate(selected_steps, 1):
+                            step = step.format(reason=reason or "this moment")
+                            response_parts.append(f"Step {i}: {step}")
+                            used_responses.append(step)
+
+                        available_follow_ups = [f for f in components["follow_ups"] if f not in used_responses]
+                        follow_up = random.choice(available_follow_ups or components["follow_ups"])
+                        used_responses.append(follow_up)
+                    else:
+                        age_context = "a young adult" if age and 18 <= age <= 25 else "someone navigating their emotions"
+                        tone_instruction = "uplifting and celebratory" if mood == "happy" else "compassionate and validating"
+                        prompt = (
+                            f"You are SerenityBot, responding in a {tone_instruction} tone. The user, {age_context}, is feeling '{mood}' because of '{reason or 'unknown'}'. "
+                            f"Input: '{user_input}'. Context: {', '.join(context) or 'none'}. "
+                            f"Generate a response starting with a heartfelt intro (e.g., 'I’m so thrilled...' for happy, 'I'm really sorry...' for others). "
+                            f"Follow with 5 numbered steps (use emojis like 🌞, 🎉 for happy; 🌿, 🧠 for others) offering immediate and long-term mental health strategies (e.g., gratitude, sharing joy for happy; grounding, self-care for others) tailored to the mood and reason. "
+                            f"End with 3 diverse follow-up options. Use an empowering tone."
+                        )
+                        try:
+                            gemini_response = self.model.generate_content(prompt)
+                            response_parts.append(gemini_response.text)
+                            follow_up = f"Would you like to {'plan a joyful activity' if mood == 'happy' else 'try a mindfulness exercise'}, create a {'joy plan' if mood == 'happy' else 'self-care plan'}, or {'connect with others' if mood == 'happy' else 'find support resources'}? (Type {'plan' if mood == 'happy' else 'mindfulness'}, {'plan' if mood == 'happy' else 'plan'}, {'connect' if mood == 'happy' else 'resources'}, or share more.)"
+                        except Exception as e:
+                            logger.warning(f"Gemini response failed: {e}")
+                            if mood == "happy":
+                                response_parts.append(
+                                    "I’m so thrilled you’re feeling happy—it’s such a beautiful moment!\n"
+                                    "Here’s a guide to keep your heart glowing:\n"
+                                    "Step 1: 🌞 Pause and feel this joy in your body.\n"
+                                    "Step 2: 🧠 Name what’s making you happy.\n"
+                                    "Step 3: 🎉 Share it with a friend or loved one.\n"
+                                    "Step 4: 💡 Do something fun, like dancing.\n"
+                                    "Step 5: 🫂 Write 3 things you’re grateful for."
+                                )
+                                follow_up = "Want to plan a fun activity or share more? (Type 'plan', 'share', or your thoughts.)"
+                            else:
+                                response_parts.append(
+                                    "I'm really sorry you're feeling this way—it’s tough, and you’re not alone.\n"
+                                    "Here’s a gentle guide to help you today:\n"
+                                    "Step 1: 🌿 Take 5 deep breaths to calm your body.\n"
+                                    "Step 2: 🧠 Name one feeling, like ‘I’m sad.’\n"
+                                    "Step 3: ✍️ Write one thought to release it.\n"
+                                    "Step 4: 💡 Ground yourself: Name 5 things you see.\n"
+                                    "Step 5: 🫂 Do one kind thing, like resting."
+                                )
+                                follow_up = "Want to try a calming exercise or talk more? (Type 'exercise', 'talk', or your thoughts.)"
+
+                final_response = "\n".join(response_parts) + "\n" + follow_up
+                if profile:
+                    profile["used_responses"] = used_responses[-50:]
+
+                self.conversation_state[conversation_id] = {
+                    "mood": mood,
+                    "used_responses": used_responses,
+                    "user_id": user_id,
+                }
+
+                self.conversation_history.setdefault(user_id, []).append({
+                    "input": user_input,
+                    "response": final_response,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                logger.info(f"User: {user_input}\nResponse: {final_response}")
+                return {"response": final_response, "conversation_id": conversation_id}
+
         except Exception as e:
             logger.error(f"Response generation error: {e}")
-            return (
-                "I'm having trouble, but I'm here:\n"
-                "I'm really sorry you're feeling this way. Here’s a gentle guide:\n"
-                "Step 1: 🌿 Take a slow breath.\n"
-                "Step 2: 🧠 Say, 'I’m feeling tough emotions.'\n"
-                "Want to share more? (Type 'talk' or 'exercise')"
-            )
+            return {"response": "I'm having trouble right now. Please try again later.", "conversation_id": None}
 
 # Initialize SerenitySupport instance
 serenity = SerenitySupport()
@@ -380,11 +428,13 @@ async def generate_response(user_input: UserInput):
             input_text = f"I’m feeling {user_input.mood} because {user_input.reason}" if user_input.reason else f"I’m feeling {user_input.mood}"
 
         # Generate response
-        response = serenity.generate_response(
+        response_data = serenity.generate_response(
             user_input=input_text,
             user_id=user_id,
             age=user_input.age,
-            reason=user_input.reason
+            reason=user_input.reason,
+            conversation_id=user_input.conversation_id,
+            stop=user_input.stop
         )
 
         # Return JSON response
@@ -396,7 +446,8 @@ async def generate_response(user_input: UserInput):
                 "reason": user_input.reason,
                 "input_text": input_text
             },
-            "response": response,
+            "response": response_data["response"],
+            "conversation_id": response_data["conversation_id"],
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
     except Exception as e:
